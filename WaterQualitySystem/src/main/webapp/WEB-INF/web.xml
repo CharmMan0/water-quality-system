@@ -1,0 +1,58 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<web-app xmlns="https://jakarta.ee/xml/ns/jakartaee"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="https://jakarta.ee/xml/ns/jakartaee https://jakarta.ee/xml/ns/jakartaee/web-app_6_0.xsd"
+         version="6.0">
+
+    <display-name>Water Quality System</display-name>
+
+    <!-- ============================================ -->
+    <!-- 编码过滤器（必须排在最前，确保最先执行）         -->
+    <!-- ============================================ -->
+    <filter>
+        <filter-name>EncodingFilter</filter-name>
+        <filter-class>com.example.waterqualitysystem.EncodingFilter</filter-class>
+    </filter>
+    <filter-mapping>
+        <filter-name>EncodingFilter</filter-name>
+        <url-pattern>/*</url-pattern>
+    </filter-mapping>
+
+    <!-- ============================================ -->
+    <!-- 登录权限过滤器（统一校验登录状态）              -->
+    <!-- 放行：login.jsp, register.jsp, /login, /register, /images/ -->
+    <!-- ============================================ -->
+    <filter>
+        <filter-name>AuthFilter</filter-name>
+        <filter-class>com.example.waterqualitysystem.AuthFilter</filter-class>
+    </filter>
+    <filter-mapping>
+        <filter-name>AuthFilter</filter-name>
+        <url-pattern>/*</url-pattern>
+    </filter-mapping>
+
+    <!-- 会话超时（30分钟） -->
+    <session-config>
+        <session-timeout>30</session-timeout>
+    </session-config>
+
+    <!-- 自定义错误页面 -->
+    <error-page>
+        <error-code>404</error-code>
+        <location>/error.jsp</location>
+    </error-page>
+    <error-page>
+        <error-code>500</error-code>
+        <location>/error.jsp</location>
+    </error-page>
+    <error-page>
+        <error-code>403</error-code>
+        <location>/error.jsp</location>
+    </error-page>
+
+    <!-- 欢迎页面 -->
+    <welcome-file-list>
+        <welcome-file>login.jsp</welcome-file>
+    </welcome-file-list>
+
+</web-app>

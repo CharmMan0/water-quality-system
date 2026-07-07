@@ -1,0 +1,136 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>水质AI检测系统 — 系统总体架构图</title>
+<style>
+  body {
+    margin: 0;
+    padding: 40px;
+    background: #fff;
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    min-height: 100vh;
+  }
+  .container {
+    width: 1100px;
+  }
+  h1 {
+    text-align: center;
+    font-family: 'Microsoft YaHei', 'SimHei', sans-serif;
+    font-size: 22px;
+    color: #1B4D6B;
+    margin-bottom: 20px;
+  }
+  .mermaid {
+    display: flex;
+    justify-content: center;
+  }
+</style>
+</head>
+<body>
+<div class="container">
+  <h1>图1  水质AI检测系统总体架构图</h1>
+  <div class="mermaid">
+graph TB
+    subgraph Browser["🖥️ 浏览器 Browser"]
+        direction TB
+        JSP1["index.jsp 检测页"]
+        JSP2["dashboard.jsp 仪表盘"]
+        JSP3["history.jsp 历史记录"]
+        JSP4["model_info.jsp 模型对比"]
+        JSP5["backup.jsp 备份管理"]
+        CSS["Crystal CSS 设计系统 + ECharts 图表库"]
+    end
+
+    subgraph Tomcat["🔷 Apache Tomcat 11  (端口 8080)"]
+        direction TB
+        subgraph Filters["Filter 过滤器链"]
+            EF["EncodingFilter — UTF-8 编码统一处理"]
+            AF["AuthFilter — 登录权限校验与拦截"]
+        end
+
+        subgraph Servlets["Servlet 业务控制层"]
+            direction LR
+            LS["LoginServlet"]
+            RS["RegisterServlet<br/>🔒 SHA-256 + 事务"]
+            PS["PredictServlet<br/>🛡️ 双层参数校验"]
+            DS["DashboardServlet"]
+            HS["HistoryServlet"]
+            BS["BackupServlet<br/>🔐 管理员鉴权"]
+            WS["WarningServlet"]
+            FS["FeedbackServlet"]
+        end
+
+        DAO["DetectionDAO — JDBC 显式事务管理"]
+    end
+
+    subgraph AI["🟢 Python FastAPI AI 微服务  (端口 8000)"]
+        direction TB
+        Endpoints["API 端点<br/> /predict/single  /predict/batch  /model/info  /model/explain  /analyze"]
+        Pipeline["数据预处理管道<br/>KNN填充 → StandardScaler → SelectKBest"]
+        Model["Voting Ensemble 集成模型<br/>RandomForest + SVM + LightGBM"]
+        SafetyGate["🛡️ Safety Gate 安全门<br/>9项指标硬性超标检测 (GB5749-2022)"]
+        Endpoints --> Pipeline --> Model --> SafetyGate
+    end
+
+    subgraph DB["🟡 MySQL 9.6  (端口 3306)"]
+        direction TB
+        Tables["12 张数据表<br/>users, water_detection, ai_model_info<br/>water_source_info, roles, announcements..."]
+        Views["4 个视图<br/>v_user_detection_summary<br/>v_model_performance..."]
+        SPs["4 个存储过程 + 4 个触发器"]
+    end
+
+    subgraph Backup["💾 数据备份系统"]
+        BF["backups/ 目录<br/>*.sql 备份文件<br/>BEFORE_RESTORE 自动快照"]
+    end
+
+    %% 数据流
+    JSP1 & JSP2 & JSP3 & JSP4 & JSP5 --> EF
+    EF --> AF
+    AF --> LS & RS & PS & DS & HS & BS & WS & FS
+
+    LS & RS & PS & DS & HS --> DAO
+    DAO -->|"JDBC"| Tables
+
+    PS -->|"HTTP POST JSON<br/>9项水质参数"| Endpoints
+    SafetyGate -->|"预测结果<br/>Safe/Unsafe + 概率 + WQI + 等级"| PS
+
+    BS -->|"mysqldump 备份"| BF
+    BF -->|"mysql 恢复"| Tables
+
+    %% 样式
+    style Browser fill:#1B4D6B,color:#fff,stroke:#0d3b54
+    style Tomcat fill:#0E5A6B,color:#fff,stroke:#0a3f4d
+    style AI fill:#0EA5A9,color:#fff,stroke:#0a7f83
+    style DB fill:#F59E0B,color:#1a1a1a,stroke:#c47f08
+    style Backup fill:#8B5CF6,color:#fff,stroke:#6d3ed4
+    style Filters fill:#1a3a4a,color:#b8d8e8,stroke:#0d2a38
+    style Servlets fill:#1a4a5a,color:#b8e0d8,stroke:#0d3845
+  </div>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+<script>
+  mermaid.initialize({
+    startOnLoad: true,
+    theme: 'base',
+    themeVariables: {
+      primaryColor: '#1B4D6B',
+      primaryTextColor: '#fff',
+      lineColor: '#64748B',
+      fontFamily: 'Microsoft YaHei, SimHei, sans-serif',
+      fontSize: '14px'
+    },
+    flowchart: {
+      useMaxWidth: true,
+      htmlLabels: true,
+      curve: 'basis',
+      nodeSpacing: 30,
+      rankSpacing: 60
+    }
+  });
+</script>
+</body>
+</html>

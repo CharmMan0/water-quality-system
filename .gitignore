@@ -1,0 +1,90 @@
+# Python 虚拟环境
+WaterQualityAI/water_ai_env/
+venv/
+.venv/
+
+# Python 缓存
+__pycache__/
+*.pyc
+
+# Maven 编译产物
+WaterQualitySystem/target/
+
+# IDE 配置
+.idea/
+*.iml
+.vscode/
+
+# 数据库备份文件
+backups/
+
+# 系统文件
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# 外部工具
+ngrok.exe
+
+# Claude Code（含 settings.local.json）
+.claude/
+
+# 凭据与启动脚本
+.env*
+*.local
+start-claude.ps1
+start-claude.bat
+start-ai_api.txt
+
+# 文档、报告、答辩指南（不上传）
+*.zip
+*.docx
+*.doc
+*.pdf
+*.mp4
+*.orig
+texput.log
+presentation.html
+PPT.html
+*PPT*.html
+水质AI检测系统*.txt
+数据库课设答辩指南*.txt
+generate_db_report.py
+generate_db_defense_guide.py
+generate_claude_guide.py
+supplement_docx.py
+generate_doc.py
+
+# 临时文件
+*.log
+*.tmp
+
+# 旧 git 备份
+.git.backup/
+
+# 课程设计文档目录
+mysql/2026课程设计/
+
+# mysql 目录中的无关文件
+mysql/微信图片*.jpg
+mysql/查看详情.html
+mysql/查看详情_files/
+mysql/require.txt
+
+# 重复的素材/测试/源码目录
+WaterQualityAI/PPT素材/
+WaterQualityAI/测试数据/
+WaterQualityAI/源码与训练产物/
+
+# 实习笔记
+WaterQualitySystem/实习/
+
+# 个人照片和无关图片
+j2EE目录/
+you.jpg
+113a9d7c-23ec-4dd2-8df3-3e853c0d5cc2.png
+
+# 无关项目
+Auto-CV-main/
+beautiful-html-templates/
+frontend-slides/
