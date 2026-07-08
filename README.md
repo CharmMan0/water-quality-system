@@ -143,4 +143,4 @@ mysql -uroot -p < mysql/water_quality_db.sql
 
 ## 👥 作者
 
-水质AI检测团队 · 2026
+[@Xiaoyuan-114](https://github.com/Xiaoyuan-114) · 2026
