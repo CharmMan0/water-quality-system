@@ -1,4 +1,4 @@
-<%@ page contentType="text/html;charset=UTF-8" language="java" %>
+<%@ page contentType="text/html;charset=UTF-8" pageEncoding="UTF-8" language="java" %>
 <%
     String pageTitle = (String) request.getAttribute("pageTitle");
     if (pageTitle == null) pageTitle = "AI智能水质检测系统";

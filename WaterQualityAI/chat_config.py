@@ -26,7 +26,7 @@ LLM_CONFIG = {
         "",  # 用环境变量 SILICONFLOW_API_KEY 传入，不写死（仓库公开，避免泄露）
     ),
     "base_url": os.getenv("LLM_BASE_URL", "https://api.siliconflow.cn/v1"),
-    "model": os.getenv("LLM_MODEL", "deepseek-ai/DeepSeek-V4-Flash"),
+    "model": os.getenv("LLM_MODEL", "Qwen/Qwen2.5-14B-Instruct"),
     "temperature": float(os.getenv("LLM_TEMPERATURE", "0.7")),
 }
 

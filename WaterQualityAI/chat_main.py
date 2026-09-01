@@ -32,6 +32,19 @@ app = FastAPI(
     version="1.0.0",
 )
 
+
+@app.on_event("startup")
+async def _warmup():
+    """启动时发一条 dummy 请求预热 LLM 连接（TCP+TLS+连接池），
+    避免用户第一次对话等冷启动的 2-3 秒。"""
+    import asyncio
+    from chat_agent import get_chat_response
+    try:
+        async for _ in get_chat_response("你好", None, None):
+            break  # 拿到第一个 token 就够了
+    except Exception:
+        pass  # 预热失败不影响启动，真用户请求时会再建连接
+
 # CORS：允许 JSP（Tomcat 8080）和 Streamlit（8501）跨域调用
 app.add_middleware(
     CORSMiddleware,
@@ -99,10 +112,11 @@ async def chat(req: ChatRequest):
                 req.query, history, req.model
             ):
                 if chunk:
-                    yield chunk
+                    # 显式 yield utf-8 字节，避免 Starlette 默认按 latin-1 编码导致中文乱码
+                    yield chunk.encode("utf-8")
         except Exception as e:
             # 流式过程中出错：把错误也吐出去，前端能看到
-            yield f"\n\n[智能体出错] {type(e).__name__}: {e}"
+            yield f"\n\n[智能体出错] {type(e).__name__}: {e}".encode("utf-8")
 
     return StreamingResponse(gen(), media_type="text/plain; charset=utf-8")
 

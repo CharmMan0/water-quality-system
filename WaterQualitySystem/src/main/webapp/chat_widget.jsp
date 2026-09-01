@@ -1,3 +1,4 @@
+<%@ page pageEncoding="UTF-8" %>
 <%--
   聊天智能体悬浮窗（全局片段）
   被 template_header.jsp 静态 include，所有页面右下角自动出现聊天气泡。

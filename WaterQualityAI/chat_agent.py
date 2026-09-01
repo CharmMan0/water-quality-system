@@ -98,17 +98,16 @@ async def get_chat_response(
     # 当前问题
     messages.append(HumanMessage(content=query))
 
-    # astream_events v2：只抓模型的流式 token，工具结果不直接吐给用户
-    # （工具结果由 LLM 自己消化后总结成自然语言）
-    async for ev in agent.astream_events(
-        {"messages": messages}, version="v2"
+    # astream + stream_mode="messages" 直接流式输出 AI 消息
+    # 比 astream_events v2 轻量得多（不需要遍历整条链的所有事件）
+    # 工具调用时 LLM 会自动消化工具结果再总结，用户只看到最终文字
+    async for msg, meta in agent.astream(
+        {"messages": messages}, stream_mode="messages"
     ):
-        kind = ev.get("event")
-        if kind == "on_chat_model_stream":
-            chunk = ev.get("data", {}).get("chunk")
-            if chunk and getattr(chunk, "content", ""):
-                yield chunk.content
-        # 工具结束：可选拼接一段提示（这里不拼，让 LLM 自己总结）
+        content = getattr(msg, "content", "")
+        # 只输出 AI 模型节点的流式 token（node="model"），跳过工具消息和空 chunk
+        if content and meta.get("langgraph_node") == "model":
+            yield content
 
 
 # ============================================================
