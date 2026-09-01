@@ -964,3 +964,6 @@
         </div>
     </div>
 </nav>
+
+<%-- 聊天智能体悬浮窗（全站通用，纯前端 fetch 调 FastAPI 8001） --%>
+<%@ include file="chat_widget.jsp" %>

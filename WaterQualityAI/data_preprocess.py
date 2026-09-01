@@ -3,13 +3,10 @@ import numpy as np
 from sklearn.preprocessing import StandardScaler
 from sklearn.impute import KNNImputer
 from sklearn.feature_selection import SelectKBest, f_classif
-import matplotlib.pyplot as plt
-import seaborn as sns
 import joblib
 
-# 设置matplotlib支持中文
-plt.rcParams['font.sans-serif'] = ['SimHei', 'DejaVu Sans', 'Arial Unicode MS']
-plt.rcParams['axes.unicode_minus'] = False
+# 注：matplotlib/seaborn 改为在 analyze_features() 内延迟 import，
+# 使推理路径（transform_data）不依赖可视化库
 
 
 # 1. 数据加载与基础清洗（仅去除重复值）
@@ -115,6 +112,10 @@ def transform_data(X, imputer, scaler, selector):
 
 # 4. 特征分析与可视化
 def analyze_features(df, target_col="Potability"):
+    import matplotlib.pyplot as plt
+    import seaborn as sns
+    plt.rcParams['font.sans-serif'] = ['SimHei', 'DejaVu Sans', 'Arial Unicode MS']
+    plt.rcParams['axes.unicode_minus'] = False
 
     # ==============================
     # 相关性分析可视化
