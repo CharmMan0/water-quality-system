@@ -11,6 +11,7 @@ public class DBUtil {
     private static final String URL =
             "jdbc:mysql://localhost:3306/water_quality_db" +
                     "?useSSL=false" +
+                    "&allowPublicKeyRetrieval=true" +
                     "&serverTimezone=Asia/Shanghai" +
                     "&characterEncoding=UTF-8";
 

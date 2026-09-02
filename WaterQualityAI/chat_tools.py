@@ -1,13 +1,22 @@
 """
 聊天智能体工具层
-4 个 LangChain Tool，挂到 create_agent 上，让 LLM 用自然语言操作水质系统
-  1. query_records   - 查历史检测记录（支持按结果/水源/条数过滤）
-  2. query_alerts    - 查预警日志（支持只看未解决）
-  3. predict_water   - 水质预测（9 项指标 → 调用 ai_api.make_prediction）
-  4. query_standards - 查水质标准 / 水源信息
+7 个 LangChain Tool，挂到 create_agent 上，让 LLM 用自然语言操作水质系统
+  1. query_records    - 查历史检测记录（支持按结果/水源/条数过滤）
+  2. query_alerts     - 查预警日志（支持只看未解决）
+  3. predict_water    - 水质预测（9 项指标 → 调用 ai_api.make_prediction）
+  4. query_standards  - 查水质标准 / 水源信息
+  5. standards_check  - 自动把检测记录与标准逐项对照，指出超标项并给建议
+  6. trend_analysis   - 水质趋势分析与未来几天简单预测（统计数据）
+  7. chart_report     - 生成图表（占比/水源对比/趋势）或导出 CSV
 所有 SQL 只读 + 参数化查询，工具只暴露「查什么」不暴露「怎么查」
 """
+import os
+import csv
+import re
+import time
 import json
+from datetime import datetime, timedelta
+
 import pymysql
 from langchain_core.tools import Tool
 
@@ -32,6 +41,441 @@ def _fetch(sql: str, params: tuple = (), limit: int = 20):
         return rows
     finally:
         conn.close()
+
+
+# ============================================================
+# 图表/导出共享基建（FastAPI 挂载 /static 后即可访问）
+# ============================================================
+# 图表和导出文件统一写到 WaterQualityAI/static/，由 chat_main 的 /static 路由对外提供
+CHAT_STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
+os.makedirs(CHAT_STATIC_DIR, exist_ok=True)
+
+# 检测表列名 -> 标准表 indicator_name（只有 ph/PpH 大小写不同，其余同名）
+COL_TO_STANDARD = {
+    "ph": "pH", "hardness": "hardness", "solids": "solids",
+    "chloramines": "chloramines", "sulfate": "sulfate",
+    "conductivity": "conductivity", "organic_carbon": "organic_carbon",
+    "trihalomethanes": "trihalomethanes", "turbidity": "turbidity",
+}
+
+# 指标超标时的处理建议（可读性用）
+INDICATOR_SUGGEST = {
+    "ph": "建议调节pH值",
+    "hardness": "建议软化/降低硬度",
+    "solids": "建议加强沉淀/过滤",
+    "chloramines": "建议优化消毒剂投加量",
+    "sulfate": "建议加强源头管控",
+    "conductivity": "建议关注溶解性总固体",
+    "organic_carbon": "建议加强有机物去除",
+    "trihalomethanes": "建议控制消毒副产物",
+    "turbidity": "建议加强混凝沉淀与过滤",
+}
+
+
+def _static_url(name: str) -> str:
+    return "/static/" + name
+
+
+def _cleanup_static(max_age_seconds: int = 86400):
+    """清理超过 1 天的历史图表/导出文件，避免 static 目录无限增长"""
+    now = time.time()
+    try:
+        for f in os.listdir(CHAT_STATIC_DIR):
+            p = os.path.join(CHAT_STATIC_DIR, f)
+            try:
+                if os.path.isfile(p) and now - os.path.getmtime(p) > max_age_seconds:
+                    os.remove(p)
+            except OSError:
+                pass
+    except OSError:
+        pass
+
+
+def _resolve_indicator(text: str):
+    """从自然语言里识别 9 项指标之一，返回检测表列名（用于趋势分析）"""
+    for alias, col in INDICATOR_ALIAS.items():
+        if alias in text:
+            return col
+    return None
+
+
+# ============================================================
+# 工具 5：标准自动对照（合规检查）
+# ============================================================
+def _check_standards(query: str) -> str:
+    """
+    把最近检测记录（或指定水源的检测记录）逐项与所选水质标准限值对照，
+    标出哪些指标超过上限/低于下限，并给出处理建议。
+    """
+    level = None
+    for lv in ["饮用水", "地表水I类", "地表水II类", "污水排放"]:
+        if lv in query:
+            level = lv
+            break
+    if level is None:
+        level = "饮用水"
+
+    std_rows = _fetch(
+        "SELECT indicator_name, min_value, max_value, unit "
+        "FROM water_standard WHERE standard_level=%s ORDER BY id",
+        (level,), limit=50,
+    )
+    if not std_rows:
+        return f"标准库中未找到「{level}」的标准数据，暂时无法做对照。"
+    std = {}
+    for r in std_rows:
+        std[r["indicator_name"]] = r
+
+    m = re.search(r"最近\s*(\d+)\s*(?:条|个)", query)
+    n = min(int(m.group(1)), 20) if m else 5
+
+    # 尽量识别水源
+    source_id = None
+    src_name = None
+    try:
+        for s in _fetch("SELECT id, source_name FROM water_source_info WHERE status=1", (), limit=100):
+            if s.get("source_name") and s["source_name"] in query:
+                source_id = s["id"]
+                src_name = s["source_name"]
+                break
+    except Exception:
+        pass
+
+    where = "WHERE d.source_id=%s " if source_id else ""
+    params: tuple = (source_id,) if source_id else ()
+    sql = (
+        "SELECT d.id, d.detect_time, d.ph, d.hardness, d.solids, d.chloramines, "
+        "d.sulfate, d.conductivity, d.organic_carbon, d.trihalomethanes, d.turbidity, "
+        "d.prediction, ws.source_name "
+        "FROM water_detection d "
+        "LEFT JOIN water_source_info ws ON d.source_id=ws.id "
+        + where
+        + "ORDER BY d.detect_time DESC LIMIT %s"
+    )
+    rows = _fetch(sql, params + (n,), limit=n)
+    if not rows:
+        return (
+            "没有找到可做标准对照的检测记录"
+            + (f"（{src_name}）" if src_name else "")
+            + "。"
+        )
+
+    lines = [f"《{level}》标准对照（共检查 {len(rows)} 条记录）："]
+    total_violations = 0
+    for rec in rows:
+        rec_id = rec["id"]
+        dtime = str(rec.get("detect_time", ""))[:19]
+        src = rec.get("source_name") or "—"
+        lines.append(f"--- 记录 #{rec_id}  {dtime}  {src}  [{rec.get('prediction')}] ---")
+        for col in ["ph", "hardness", "solids", "chloramines", "sulfate",
+                    "conductivity", "organic_carbon", "trihalomethanes", "turbidity"]:
+            val = rec.get(col)
+            if val is None:
+                continue
+            ind = COL_TO_STANDARD.get(col, col)
+            srow = std.get(ind)
+            if not srow:
+                continue
+            lo = srow.get("min_value")
+            hi = srow.get("max_value")
+            unit = srow.get("unit") or ""
+            suggestion = INDICATOR_SUGGEST.get(col, "建议人工复核")
+            if lo is not None and val < lo:
+                total_violations += 1
+                lines.append(f"  ⚠️ {ind}：{val} {unit}，低于下限 {lo}（限值 {lo}~{hi}）{suggestion}")
+            elif hi is not None and val > hi:
+                total_violations += 1
+                lines.append(f"  ⚠️ {ind}：{val} {unit}，超过上限 {hi}（限值 {lo}~{hi}）{suggestion}")
+
+    if total_violations == 0:
+        lines.append(f"✅ 所选记录全部在《{level}》标准限值范围内。")
+    else:
+        lines.append(f"共发现 {total_violations} 项指标超标/偏低。")
+    return "\n".join(lines)
+
+
+# ============================================================
+# 工具 6：水质趋势分析/预测（用历史检测数据做统计趋势）
+# ============================================================
+def _trend_series(col=None, source_id=None, days=30):
+    """返回 [(日期, 值, 条数)]。col=None 时值=当日「Unsafe 占比(%)」。"""
+    cutoff = datetime.now() - timedelta(days=days)
+    where = ["d.detect_time >= %s"]
+    params: list = [cutoff.strftime("%Y-%m-%d %H:%M:%S")]
+    if source_id:
+        where.append("d.source_id=%s")
+        params.append(source_id)
+    w = " AND ".join(where)
+
+    if col:
+        # 只允许白名单列名，防止 SQL 注入
+        if col not in PREDICT_COLS:
+            col = None
+        else:
+            sql = (
+                f"SELECT DATE(d.detect_time) AS day, AVG(d.{col}) AS val, COUNT(*) AS cnt "
+                f"FROM water_detection d WHERE {w} GROUP BY DATE(d.detect_time) ORDER BY day"
+            )
+            rows = _fetch(sql, tuple(params), limit=2000)
+            out = []
+            for r in rows:
+                v = r.get("val")
+                out.append((str(r["day"]), float(v) if v is not None else None, int(r.get("cnt") or 0)))
+            return out
+
+    sql = (
+        "SELECT DATE(d.detect_time) AS day, COUNT(*) AS cnt, "
+        "SUM(CASE WHEN d.prediction='Unsafe' THEN 1 ELSE 0 END) AS unsafe_cnt "
+        f"FROM water_detection d WHERE {w} GROUP BY DATE(d.detect_time) ORDER BY day"
+    )
+    rows = _fetch(sql, tuple(params), limit=2000)
+    out = []
+    for r in rows:
+        cnt = int(r.get("cnt") or 0)
+        val = (int(r.get("unsafe_cnt") or 0) / cnt * 100.0) if cnt else None
+        out.append((str(r["day"]), val, cnt))
+    return out
+
+
+def _linear_forecast(values, horizon=3):
+    """用最小二乘线性拟合做未来 horizon 天简单外推。返回 (slope, forecast list) 或 None。"""
+    data = [(i, v) for i, v in enumerate(values) if v is not None]
+    if len(data) < 2:
+        return None
+    try:
+        import numpy as np
+    except Exception:
+        return None
+    x = np.array([p[0] for p in data], dtype=float)
+    y = np.array([p[1] for p in data], dtype=float)
+    if x.std() == 0:
+        slope = 0.0
+    else:
+        slope = float(np.polyfit(x, y, 1)[0])
+    last = data[-1][1]
+    forecast = [last + slope * (i + 1) for i in range(horizon)]
+    return slope, forecast
+
+
+def _trend_analysis(query: str) -> str:
+    """
+    对某个指标（或整体安全占比）做近 N 天趋势分析，并给出未来 3 天的简单预测。
+    """
+    indicator = _resolve_indicator(query)
+    col = indicator if indicator in PREDICT_COLS else None
+
+    days_m = re.search(r"最近\s*(\d+)\s*天", query)
+    days = min(int(days_m.group(1)), 90) if days_m else 30
+
+    source_id = None
+    src_name = None
+    try:
+        for s in _fetch("SELECT id, source_name FROM water_source_info WHERE status=1", (), limit=100):
+            if s.get("source_name") and s["source_name"] in query:
+                source_id = s["id"]
+                src_name = s["source_name"]
+                break
+    except Exception:
+        pass
+
+    series = _trend_series(col=col, source_id=source_id, days=days)
+    if not series:
+        return (
+            "近 " + str(days) + " 天没有检测数据"
+            + (f"（{src_name}）" if src_name else "")
+            + "，无法做趋势分析。"
+        )
+
+    values = [v for _, v, _ in series]
+    label = "Unsafe 占比" if col is None else f"{col}"
+    unit = "%" if col is None else "（原始单位）"
+    valid = [(d, v) for d, v, _ in series if v is not None]
+    latest = valid[-1][1] if valid else None
+    avg = sum(v for _, v in valid) / len(valid) if valid else None
+
+    fc = _linear_forecast([v for _, v in valid], horizon=3)
+    lines = [
+        f"水质趋势分析（{label}，近 {days} 天，"
+        f"{series[0][0]} ~ {series[-1][0]}" + (f"，来源：{src_name}" if src_name else "") + "）：",
+        f"- 近期平均：{avg:.2f}{unit}，最新：{latest:.2f}{unit}",
+    ]
+    if fc:
+        slope, forecast = fc
+        if slope > 0.05:
+            trend = "上升（风险变大）" if col is None else "上升"
+        elif slope < -0.05:
+            trend = "下降（风险变小）" if col is None else "下降"
+        else:
+            trend = "基本平稳"
+        lines.append(f"- 趋势：{trend}（斜率 {slope:.3f}/天）")
+        lines.append(
+            "- 未来 3 天预测：" + "、".join(f"{x:.2f}{unit}" for x in forecast)
+        )
+    return "\n".join(lines)
+
+
+# ============================================================
+# 图表/导出生成（matplotlib + CSV，写到 /static）
+# ============================================================
+def _mpl():
+    """初始化 matplotlib，支持中文显示（Windows 常用中文字体）。"""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    plt.rcParams["font.sans-serif"] = ["Microsoft YaHei", "SimHei", "sans-serif"]
+    plt.rcParams["axes.unicode_minus"] = False
+    return plt
+
+
+def _save_fig(fig, prefix):
+    _cleanup_static()
+    fn = f"{prefix}_{int(time.time())}.png"
+    path = os.path.join(CHAT_STATIC_DIR, fn)
+    try:
+        fig.savefig(path, dpi=110, bbox_inches="tight")
+    finally:
+        try:
+            import matplotlib.pyplot as plt
+            plt.close(fig)
+        except Exception:
+            pass
+    return _static_url(fn)
+
+
+def _chart_pie():
+    """安全/不合格占比饼图"""
+    plt = _mpl()
+    rows = _fetch("SELECT prediction, COUNT(*) AS cnt FROM water_detection GROUP BY prediction", (), limit=50)
+    labels = [r["prediction"] for r in rows]
+    sizes = [r["cnt"] for r in rows]
+    colors = ["#22c55e" if l == "Safe" else "#ef4444" for l in labels]
+    fig, ax = plt.subplots(figsize=(5, 4))
+    ax.pie(sizes, labels=labels, colors=colors, autopct="%1.1f%%", startangle=90)
+    ax.set_title("检测结果分布（Safe vs Unsafe）")
+    return _save_fig(fig, "pie"), "检测结果分布图"
+
+
+def _chart_source_bar():
+    """各水源检测量/不合格量柱状图"""
+    plt = _mpl()
+    rows = _fetch(
+        "SELECT COALESCE(ws.source_name, CONCAT('水源#', d.source_id)) AS src, "
+        "COUNT(*) AS cnt, SUM(CASE WHEN d.prediction='Unsafe' THEN 1 ELSE 0 END) AS unsafe_cnt "
+        "FROM water_detection d "
+        "LEFT JOIN water_source_info ws ON d.source_id=ws.id "
+        "GROUP BY d.source_id, ws.source_name ORDER BY cnt DESC LIMIT 15",
+        (), limit=50,
+    )
+    if not rows:
+        return None, "没有可绘制的检测数据"
+    names = [r["src"] for r in rows]
+    total = [r["cnt"] for r in rows]
+    unsafe = [r["unsafe_cnt"] or 0 for r in rows]
+    x = range(len(names))
+    fig, ax = plt.subplots(figsize=(7, 4))
+    ax.bar(x, total, color="#0ea5e9", label="检测量")
+    ax.bar(x, unsafe, color="#ef4444", label="不合格量")
+    ax.set_xticks(list(x))
+    ax.set_xticklabels(names, rotation=30, ha="right", fontsize=8)
+    ax.set_title("各水源检测量 / 不合格量")
+    ax.legend()
+    fig.tight_layout()
+    return _save_fig(fig, "source"), "各水源对比图"
+
+
+def _chart_trend(col=None, source_id=None, days=30, title=None):
+    """指标/安全占比趋势折线图"""
+    plt = _mpl()
+    series = _trend_series(col=col, source_id=source_id, days=days)
+    if not series:
+        return None, "没有可绘制的趋势数据"
+    valid = [(d, v) for d, v, _ in series if v is not None]
+    dates = [d for d, _ in valid]
+    vals = [v for _, v in valid]
+    if not dates:
+        return None, "没有可绘制的趋势数据"
+    fig, ax = plt.subplots(figsize=(7, 3.8))
+    ax.plot(range(len(dates)), vals, marker="o", color="#0ea5e9", linewidth=2)
+    ax.set_xticks(range(len(dates)))
+    ax.set_xticklabels(dates, rotation=30, ha="right", fontsize=7)
+    label = "Unsafe 占比(%)" if col is None else f"{col}"
+    ax.set_ylabel(label)
+    ax.set_title(title or f"{label} 近 {days} 天趋势")
+    ax.grid(alpha=0.3)
+    fig.tight_layout()
+    return _save_fig(fig, "trend"), f"{label}趋势图"
+
+
+def _export_records_csv(query: str) -> str:
+    """把符合过滤条件的检测记录导出为 CSV（带 BOM，Excel 直接打开不乱码）。"""
+    q = query.lower()
+    where = ""
+    params: tuple = ()
+    if "不合格" in query or "不安全" in q or "unsafe" in q:
+        where = "WHERE d.prediction=%s"
+        params = ("Unsafe",)
+    elif "合格" in query or "安全" in q or "safe" in q:
+        where = "WHERE d.prediction=%s"
+        params = ("Safe",)
+
+    m = re.search(r"最近\s*(\d+)\s*(?:条|个)", query)
+    n = min(int(m.group(1)), 500) if m else 200
+
+    rows = _fetch(
+        "SELECT d.id, u.username, ws.source_name, d.ph, d.hardness, d.solids, "
+        "d.chloramines, d.sulfate, d.conductivity, d.organic_carbon, "
+        "d.trihalomethanes, d.turbidity, d.prediction, ROUND(d.probability,3) AS probability, "
+        "d.wqi_score, d.water_grade, d.standard_level, d.detect_time "
+        "FROM water_detection d "
+        "LEFT JOIN users u ON d.user_id=u.id "
+        "LEFT JOIN water_source_info ws ON d.source_id=ws.id "
+        + where + " ORDER BY d.detect_time DESC LIMIT %s",
+        params + (n,), limit=n,
+    )
+    if not rows:
+        return "没有可导出的检测记录。"
+
+    _cleanup_static()
+    fn = f"records_{int(time.time())}.csv"
+    path = os.path.join(CHAT_STATIC_DIR, fn)
+    with open(path, "w", newline="", encoding="utf-8-sig") as f:
+        writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
+        writer.writeheader()
+        writer.writerows(rows)
+    return f"已导出 {len(rows)} 条检测记录：\n[下载 CSV](/static/{fn})"
+
+
+def _chart_report(query: str) -> str:
+    """生成图表（分布/水源对比/趋势）或导出 CSV。"""
+    if any(k in query.lower() for k in ["导出", "excel", "csv", "下载"]):
+        return _export_records_csv(query)
+
+    q = query.lower()
+    try:
+        if any(k in query for k in ["水源", "采样点", "source"]) or "对比" in query:
+            url, title = _chart_source_bar()
+        elif any(k in query for k in ["趋势", "变化", "走势"]):
+            indicator = _resolve_indicator(query)
+            col = indicator if indicator in PREDICT_COLS else None
+            source_id = None
+            try:
+                for s in _fetch("SELECT id, source_name FROM water_source_info WHERE status=1", (), limit=100):
+                    if s.get("source_name") and s["source_name"] in query:
+                        source_id = s["id"]
+                        break
+            except Exception:
+                pass
+            days_m = re.search(r"最近\s*(\d+)\s*天", query)
+            days = min(int(days_m.group(1)), 90) if days_m else 30
+            url, title = _chart_trend(col=col, source_id=source_id, days=days)
+        else:
+            url, title = _chart_pie()
+    except Exception as e:
+        return "图表生成失败：" + type(e).__name__ + ": " + str(e).split("\n")[0]
+
+    if not url:
+        return "图表生成失败：" + (title or "无数据")
+    return f"{title}：\n![{title}]({url})"
 
 
 # ============================================================
@@ -251,10 +695,138 @@ def _query_standards(query: str) -> str:
 
 
 # ============================================================
+# 会话历史持久化（chat_session / chat_message 表）
+# ============================================================
+def _ensure_tables():
+    """确保会话历史表存在（幂等）"""
+    conn = _get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "CREATE TABLE IF NOT EXISTS chat_session ("
+                " id VARCHAR(64) PRIMARY KEY,"
+                " client_id VARCHAR(64) NOT NULL,"
+                " title VARCHAR(200) NOT NULL,"
+                " created_at DATETIME DEFAULT CURRENT_TIMESTAMP,"
+                " updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,"
+                " INDEX idx_client (client_id)"
+                ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"
+            )
+            cur.execute(
+                "CREATE TABLE IF NOT EXISTS chat_message ("
+                " id BIGINT AUTO_INCREMENT PRIMARY KEY,"
+                " session_id VARCHAR(64) NOT NULL,"
+                " role VARCHAR(10) NOT NULL,"
+                " content MEDIUMTEXT NOT NULL,"
+                " created_at DATETIME DEFAULT CURRENT_TIMESTAMP,"
+                " INDEX idx_session (session_id)"
+                ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def create_chat_session(client_id: str, title: str = None) -> dict:
+    """新建会话，返回 {session_id, title, created_at}"""
+    import uuid
+    sid = uuid.uuid4().hex
+    title = (title or "新对话").strip()[:60] or "新对话"
+    conn = _get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO chat_session (id, client_id, title) VALUES (%s,%s,%s)",
+                (sid, client_id, title),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+    return {"session_id": sid, "title": title}
+
+
+def list_chat_sessions(client_id: str, limit: int = 30) -> list:
+    """按更新时间倒序返回该 client 的会话列表"""
+    conn = _get_conn()
+    try:
+        with conn.cursor(pymysql.cursors.DictCursor) as cur:
+            cur.execute(
+                "SELECT s.id, s.title, s.created_at, s.updated_at, "
+                "(SELECT COUNT(*) FROM chat_message m WHERE m.session_id=s.id) AS msg_count, "
+                "(SELECT m.content FROM chat_message m WHERE m.session_id=s.id "
+                " ORDER BY m.id DESC LIMIT 1) AS last_preview "
+                "FROM chat_session s WHERE s.client_id=%s "
+                "ORDER BY s.updated_at DESC LIMIT %s",
+                (client_id, limit),
+            )
+            rows = cur.fetchall()
+        for r in rows:
+            for k in ("created_at", "updated_at"):
+                if r.get(k):
+                    r[k] = str(r[k])
+            if r.get("last_preview") and len(r["last_preview"]) > 80:
+                r["last_preview"] = r["last_preview"][:80] + "…"
+        return rows
+    finally:
+        conn.close()
+
+
+def get_chat_messages(session_id: str) -> list:
+    """返回某会话的全部消息 [{role, content, created_at}]"""
+    conn = _get_conn()
+    try:
+        with conn.cursor(pymysql.cursors.DictCursor) as cur:
+            cur.execute(
+                "SELECT role, content, created_at FROM chat_message "
+                "WHERE session_id=%s ORDER BY id",
+                (session_id,),
+            )
+            rows = cur.fetchall()
+        for r in rows:
+            if r.get("created_at"):
+                r["created_at"] = str(r["created_at"])
+        return rows
+    finally:
+        conn.close()
+
+
+def add_chat_message(session_id: str, role: str, content: str, update_title: bool = False) -> None:
+    """写入一条消息；update_title=True 时若标题仍是默认值则用首条用户消息更新标题"""
+    conn = _get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO chat_message (session_id, role, content) VALUES (%s,%s,%s)",
+                (session_id, role, content),
+            )
+            if update_title and role == "user" and content.strip():
+                title = content.strip().replace("\n", " ")[:30]
+                cur.execute(
+                    "UPDATE chat_session SET title=%s WHERE id=%s AND title='新对话'",
+                    (title, session_id),
+                )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def delete_chat_session(session_id: str) -> None:
+    """删除会话及其消息"""
+    conn = _get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM chat_message WHERE session_id=%s", (session_id,))
+            cur.execute("DELETE FROM chat_session WHERE id=%s", (session_id,))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+# ============================================================
 # 包装成 LangChain Tool 列表
 # ============================================================
 def get_chat_tools() -> list:
-    """返回 4 个 LangChain Tool，供 create_agent 挂载"""
+    """返回 7 个 LangChain Tool，供 create_agent 挂载"""
     return [
         Tool(
             name="query_records",
@@ -295,5 +867,38 @@ def get_chat_tools() -> list:
                 "输入参数 query：用户的自然语言描述。"
             ),
             func=_query_standards,
+        ),
+        Tool(
+            name="standards_check",
+            description=(
+                "把最近检测记录（或指定水源的检测记录）逐项与所选水质标准对照，"
+                "指出哪些指标超过上限/低于下限，并给处理建议。"
+                "当用户问『最近这批水样哪些指标超标』『对照饮用水标准检查一下』"
+                "『这条记录合不合规』时用这个工具。"
+                "输入参数 query：用户的自然语言描述（可含标准等级、水源名、最近N条）。"
+            ),
+            func=_check_standards,
+        ),
+        Tool(
+            name="trend_analysis",
+            description=(
+                "对某一水质指标或整体『不安全占比』做近 N 天趋势分析，"
+                "并给出未来 3 天的简单预测。"
+                "当用户问『最近水质趋势怎么样』『turbidity 近30天走势』"
+                "『不安全比例是在上升还是下降』时用这个工具。"
+                "输入参数 query：用户的自然语言描述（可含指标名、水源名、最近N天）。"
+            ),
+            func=_trend_analysis,
+        ),
+        Tool(
+            name="chart_report",
+            description=(
+                "生成图表或用 CSV 导出检测记录。图表类型按用户描述自动判断："
+                "『分布/占比』→ Safe/Unsafe 饼图；『水源/对比』→ 各水源柱状图；"
+                "『趋势/走势』→ 折线图；『导出/下载 excel/csv』→ 生成 CSV 下载链接。"
+                "输出会带一个图片或下载链接，请原样保留在回答末尾。"
+                "输入参数 query：用户的自然语言描述。"
+            ),
+            func=_chart_report,
         ),
     ]
