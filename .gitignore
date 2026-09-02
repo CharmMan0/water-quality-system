@@ -35,6 +35,7 @@ ngrok.exe
 start-claude.ps1
 start-claude.bat
 start-ai_api.txt
+*.bat
 
 # 文档、报告、答辩指南（不上传）
 *.zip
@@ -88,3 +89,4 @@ you.jpg
 Auto-CV-main/
 beautiful-html-templates/
 frontend-slides/
+WaterQualityAI/static/
